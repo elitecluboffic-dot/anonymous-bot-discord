@@ -557,7 +557,7 @@ async def cmd_status(ctx: commands.Context):
     await ctx.author.send(embed=embed)
 
 
-@bot.command(name="help")
+@bot.command(name="anonymous")
 async def cmd_help(ctx: commands.Context):
     msg = (
         "**📖 Panduan Anonymous Chat Bot**\n\n"
