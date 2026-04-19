@@ -18,13 +18,16 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
-ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "admin")  # Contoh: @namaadmin
+ADMIN_CONTACT_ID = os.getenv("ADMIN_CONTACT_ID", "")  # Discord ID admin, untuk mention yang bisa diklik
 
 ADMIN_IDS: set[int] = set()
 for aid in ADMIN_IDS_RAW.split(","):
     aid = aid.strip()
     if aid.isdigit():
         ADMIN_IDS.add(int(aid))
+
+# Format mention yang bisa diklik di Discord
+ADMIN_MENTION = f"<@{ADMIN_CONTACT_ID}>" if ADMIN_CONTACT_ID else "@admin"
 
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN tidak ditemukan!")
@@ -590,7 +593,7 @@ async def cmd_premium(ctx: commands.Context):
     embed.add_field(
         name="📲 Cara Beli",
         value=(
-            "1. DM admin: **" + ADMIN_CONTACT + "**\n"
+            "1. DM admin: " + ADMIN_MENTION + "\n"
             "2. Setelah bayar, kamu dapat key unik\n"
             "3. Ketik `!redeem <key>` untuk aktivasi\n"
         ),
