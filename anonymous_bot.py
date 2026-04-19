@@ -548,7 +548,7 @@ async def cmd_status(ctx: commands.Context):
     embed.add_field(name="Status Chat", value=status, inline=False)
     embed.add_field(
         name="Akun",
-        value=f"⭐ **Premium** — berlaku hingga `{datetime.fromisoformat(expiry).strftime('%d %b %Y')}"`
+        value=("⭐ **Premium** — berlaku hingga **" + datetime.fromisoformat(expiry).strftime('%d %b %Y') + "**")
               if prem and expiry else "🆓 Free",
         inline=False
     )
