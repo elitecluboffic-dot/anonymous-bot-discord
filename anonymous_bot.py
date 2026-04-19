@@ -6,7 +6,7 @@ import time
 import os
 import uuid
 import asyncpg
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from collections import defaultdict
 from dotenv import load_dotenv
@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 # ─────────────────────────────────────────────
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Railway PostgreSQL URL
+DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 ADMIN_CONTACT_ID = os.getenv("ADMIN_CONTACT_ID", "")
 
@@ -113,6 +113,12 @@ async def init_db():
     log.info("Database initialized.")
 
 # ─────────────────────────────────────────────
+#  UTIL
+# ─────────────────────────────────────────────
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+# ─────────────────────────────────────────────
 #  DB HELPERS — PREMIUM USERS
 # ─────────────────────────────────────────────
 async def is_premium(user_id: int) -> bool:
@@ -122,7 +128,7 @@ async def is_premium(user_id: int) -> bool:
         )
     if not row:
         return False
-    return row["expiry"].replace(tzinfo=None) > datetime.utcnow()
+    return row["expiry"] > now_utc()
 
 async def get_premium_expiry(user_id: int) -> Optional[datetime]:
     async with db_pool.acquire() as conn:
@@ -185,15 +191,10 @@ async def activate_key(user_id: int, key: str) -> tuple[bool, str]:
         return False, "❌ Key ini sudah pernah digunakan."
 
     days = key_data["days"]
-    now = datetime.utcnow()
+    now = now_utc()
 
     current_expiry = await get_premium_expiry(user_id)
-    if current_expiry:
-        exp_naive = current_expiry.replace(tzinfo=None)
-        start = exp_naive if exp_naive > now else now
-    else:
-        start = now
-
+    start = current_expiry if current_expiry and current_expiry > now else now
     new_expiry = start + timedelta(days=days)
 
     await set_premium_user(user_id, new_expiry, f"{days} hari")
@@ -420,7 +421,7 @@ async def on_command_error(ctx: commands.Context, error):
         await safe_send(ctx.author, "❌ Terjadi error. Coba lagi nanti.")
 
 # ─────────────────────────────────────────────
-#  MATCH LOGIC (with lock — fix race condition)
+#  MATCH LOGIC
 # ─────────────────────────────────────────────
 async def do_match(user: discord.User):
     async with match_lock:
@@ -432,18 +433,20 @@ async def do_match(user: discord.User):
             partner_id = available[0]
             remove_from_queue(partner_id)
 
-            active_pairs[user_id] = partner_id
-            active_pairs[partner_id] = user_id
-            record_pair(user_id, partner_id)
+            # Fetch partner dulu sebelum update state
+            partner = await get_user_safe(partner_id)
             if not partner:
-                del active_pairs[user_id]
-                del active_pairs[partner_id]
+                # Partner tidak bisa di-fetch, kembalikan ke antrian
                 if prem:
                     premium_queue[user_id] = time.time()
                 else:
                     waiting_queue[user_id] = time.time()
                 await safe_send(user, "🔍 Menambahkan ke antrian... menunggu orang asing.")
                 return
+
+            active_pairs[user_id] = partner_id
+            active_pairs[partner_id] = user_id
+            record_pair(user_id, partner_id)
 
             partner_prem = await is_premium(partner_id)
             embed_user = await build_match_embed(partner_id, show_info=prem)
@@ -454,10 +457,10 @@ async def do_match(user: discord.User):
                 premium_queue[user_id] = time.time()
             else:
                 waiting_queue[user_id] = time.time()
-            available = None
+            partner = None
 
     # Kirim embed di luar lock supaya tidak blocking
-    if available:
+    if partner:
         await safe_send(user, embed=embed_user)
         await safe_send(partner, embed=embed_partner)
         log.info(f"Match: {user_id}{'⭐' if prem else ''} <-> {partner_id}{'⭐' if partner_prem else ''}")
