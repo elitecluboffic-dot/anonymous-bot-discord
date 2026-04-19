@@ -1,24 +1,24 @@
 import discord
 from discord.ext import commands, tasks
 import asyncio
-import random
 import logging
 import time
 import os
-import json
 import uuid
+import asyncpg
 from datetime import datetime, timedelta
 from typing import Optional
 from collections import defaultdict
 from dotenv import load_dotenv
 
 # ─────────────────────────────────────────────
-#  LOAD TOKEN
+#  LOAD ENV
 # ─────────────────────────────────────────────
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Railway PostgreSQL URL
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
-ADMIN_CONTACT_ID = os.getenv("ADMIN_CONTACT_ID", "")  # Discord ID admin, untuk mention yang bisa diklik
+ADMIN_CONTACT_ID = os.getenv("ADMIN_CONTACT_ID", "")
 
 ADMIN_IDS: set[int] = set()
 for aid in ADMIN_IDS_RAW.split(","):
@@ -26,17 +26,17 @@ for aid in ADMIN_IDS_RAW.split(","):
     if aid.isdigit():
         ADMIN_IDS.add(int(aid))
 
-# Format mention yang bisa diklik di Discord
 ADMIN_MENTION = f"<@{ADMIN_CONTACT_ID}>" if ADMIN_CONTACT_ID else "@admin"
 
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN tidak ditemukan!")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL tidak ditemukan!")
 
 # ─────────────────────────────────────────────
 #  KONFIGURASI
 # ─────────────────────────────────────────────
 QUEUE_TIMEOUT_SECONDS = 300
-QUEUE_TIMEOUT_PREMIUM = 99999
 CLEANUP_INTERVAL_SECONDS = 60
 COOLDOWN_SECONDS = 3
 
@@ -45,19 +45,13 @@ PREMIUM_PLANS = {
     "30": {"days": 30, "price": 190000, "label": "30 Hari"},
 }
 
-KEYS_FILE = "premium_keys.json"
-USERS_FILE = "premium_users.json"
-
 # ─────────────────────────────────────────────
 #  LOGGING
 # ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ],
+    handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
 
@@ -71,104 +65,161 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ─────────────────────────────────────────────
-#  STATE MANAGEMENT
+#  STATE (in-memory, non-persistent by design)
 # ─────────────────────────────────────────────
 active_pairs: dict[int, int] = {}
 waiting_queue: dict[int, float] = {}
 premium_queue: dict[int, float] = {}
 command_cooldown: dict[int, float] = defaultdict(float)
-user_info: dict[int, dict] = {}
+recent_partners: dict[int, list[int]] = defaultdict(list)
+match_lock = asyncio.Lock()
 
+MAX_RECENT = 10
 
 # ─────────────────────────────────────────────
-#  PREMIUM KEY STORAGE
+#  DATABASE POOL
 # ─────────────────────────────────────────────
-def load_keys() -> dict:
-    try:
-        with open(KEYS_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+db_pool: asyncpg.Pool = None
 
-def save_keys(data: dict):
-    with open(KEYS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS premium_keys (
+                key         TEXT PRIMARY KEY,
+                days        INTEGER NOT NULL,
+                plan        TEXT NOT NULL,
+                price       INTEGER NOT NULL,
+                used        BOOLEAN DEFAULT FALSE,
+                used_by     BIGINT,
+                used_at     TIMESTAMPTZ,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                created_by  BIGINT NOT NULL
+            );
 
-def load_users() -> dict:
-    try:
-        with open(USERS_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+            CREATE TABLE IF NOT EXISTS premium_users (
+                user_id     BIGINT PRIMARY KEY,
+                expiry      TIMESTAMPTZ NOT NULL,
+                plan        TEXT NOT NULL,
+                activated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
 
-def save_users(data: dict):
-    with open(USERS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+            CREATE TABLE IF NOT EXISTS user_info (
+                user_id     BIGINT PRIMARY KEY,
+                gender      TEXT NOT NULL
+            );
+        """)
+    log.info("Database initialized.")
 
+# ─────────────────────────────────────────────
+#  DB HELPERS — PREMIUM USERS
+# ─────────────────────────────────────────────
+async def is_premium(user_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT expiry FROM premium_users WHERE user_id = $1", user_id
+        )
+    if not row:
+        return False
+    return row["expiry"].replace(tzinfo=None) > datetime.utcnow()
+
+async def get_premium_expiry(user_id: int) -> Optional[datetime]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT expiry FROM premium_users WHERE user_id = $1", user_id
+        )
+    return row["expiry"] if row else None
+
+async def set_premium_user(user_id: int, expiry: datetime, plan: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO premium_users (user_id, expiry, plan, activated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+                SET expiry = EXCLUDED.expiry,
+                    plan = EXCLUDED.plan,
+                    activated_at = NOW()
+        """, user_id, expiry, plan)
+
+# ─────────────────────────────────────────────
+#  DB HELPERS — KEYS
+# ─────────────────────────────────────────────
 def generate_key(days: int) -> str:
     prefix = "PREM7" if days == 7 else "PREM30"
     return f"{prefix}-{uuid.uuid4().hex[:6].upper()}-{uuid.uuid4().hex[:6].upper()}"
 
-def is_premium(user_id: int) -> bool:
-    users = load_users()
-    uid = str(user_id)
-    if uid not in users:
-        return False
-    expiry = users[uid].get("expiry")
-    if not expiry:
-        return False
-    return datetime.fromisoformat(expiry) > datetime.now()
+async def save_key(key: str, days: int, plan: str, price: int, created_by: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO premium_keys (key, days, plan, price, created_by)
+            VALUES ($1, $2, $3, $4, $5)
+        """, key, days, plan, price, created_by)
 
-def get_premium_expiry(user_id: int) -> Optional[str]:
-    users = load_users()
-    uid = str(user_id)
-    if uid not in users:
-        return None
-    return users[uid].get("expiry")
+async def get_key(key: str):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT * FROM premium_keys WHERE key = $1", key
+        )
 
-def activate_key(user_id: int, key: str) -> tuple[bool, str]:
-    keys = load_keys()
-    users = load_users()
-    uid = str(user_id)
+async def mark_key_used(key: str, user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE premium_keys
+            SET used = TRUE, used_by = $1, used_at = NOW()
+            WHERE key = $2
+        """, user_id, key)
 
-    if key not in keys:
+async def list_keys(limit: int = 20):
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            "SELECT * FROM premium_keys ORDER BY created_at DESC LIMIT $1", limit
+        )
+
+async def activate_key(user_id: int, key: str) -> tuple[bool, str]:
+    key_data = await get_key(key)
+
+    if not key_data:
         return False, "❌ Key tidak valid atau tidak ditemukan."
-
-    key_data = keys[key]
-
-    if key_data.get("used"):
+    if key_data["used"]:
         return False, "❌ Key ini sudah pernah digunakan."
 
     days = key_data["days"]
-    now = datetime.now()
+    now = datetime.utcnow()
 
-    current_expiry = None
-    if uid in users and users[uid].get("expiry"):
-        current_exp = datetime.fromisoformat(users[uid]["expiry"])
-        if current_exp > now:
-            current_expiry = current_exp
+    current_expiry = await get_premium_expiry(user_id)
+    if current_expiry:
+        exp_naive = current_expiry.replace(tzinfo=None)
+        start = exp_naive if exp_naive > now else now
+    else:
+        start = now
 
-    start = current_expiry if current_expiry else now
     new_expiry = start + timedelta(days=days)
 
-    users[uid] = {
-        "user_id": user_id,
-        "expiry": new_expiry.isoformat(),
-        "plan": f"{days} hari",
-        "activated_at": now.isoformat(),
-    }
+    await set_premium_user(user_id, new_expiry, f"{days} hari")
+    await mark_key_used(key, user_id)
 
-    keys[key]["used"] = True
-    keys[key]["used_by"] = user_id
-    keys[key]["used_at"] = now.isoformat()
-
-    save_users(users)
-    save_keys(keys)
-
-    label = "7 Hari" if days == 7 else "30 Hari"
-    expiry_str = new_expiry.strftime("%d %B %Y %H:%M")
+    label = key_data["plan"]
+    expiry_str = new_expiry.strftime("%d %B %Y %H:%M") + " UTC"
     return True, f"✅ **Premium {label} aktif!**\nBerlaku hingga: `{expiry_str}`"
 
+# ─────────────────────────────────────────────
+#  DB HELPERS — USER INFO
+# ─────────────────────────────────────────────
+async def set_user_gender(user_id: int, gender: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO user_info (user_id, gender)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET gender = EXCLUDED.gender
+        """, user_id, gender)
+
+async def get_user_gender(user_id: int) -> Optional[str]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT gender FROM user_info WHERE user_id = $1", user_id
+        )
+    return row["gender"] if row else None
 
 # ─────────────────────────────────────────────
 #  HELPER FUNCTIONS
@@ -186,7 +237,7 @@ def remove_from_queue(user_id: int):
     waiting_queue.pop(user_id, None)
     premium_queue.pop(user_id, None)
 
-def remove_pair(user_id: int):
+def remove_pair(user_id: int) -> Optional[int]:
     partner_id = active_pairs.pop(user_id, None)
     if partner_id:
         active_pairs.pop(partner_id, None)
@@ -200,9 +251,24 @@ def update_cooldown(user_id: int):
     command_cooldown[user_id] = time.time()
 
 def get_available_partners(user_id: int) -> list[int]:
-    premium = [uid for uid in premium_queue if uid != user_id]
-    free = [uid for uid in waiting_queue if uid != user_id]
+    excluded = set(recent_partners[user_id]) | {user_id}
+    premium = [uid for uid in premium_queue if uid not in excluded]
+    free = [uid for uid in waiting_queue if uid not in excluded]
+
+    # Fallback: kalau antrian kecil dan semua sudah pernah ketemu, abaikan history
+    if not premium and not free:
+        premium = [uid for uid in premium_queue if uid != user_id]
+        free = [uid for uid in waiting_queue if uid != user_id]
+
     return premium + free
+
+def record_pair(user_id: int, partner_id: int):
+    for uid, pid in [(user_id, partner_id), (partner_id, user_id)]:
+        if pid in recent_partners[uid]:
+            recent_partners[uid].remove(pid)
+        recent_partners[uid].append(pid)
+        if len(recent_partners[uid]) > MAX_RECENT:
+            recent_partners[uid].pop(0)
 
 async def safe_send(user: discord.User, content: str = "", embed=None) -> bool:
     try:
@@ -233,15 +299,14 @@ async def get_user_safe(user_id: int) -> Optional[discord.User]:
         log.error(f"Error mengambil user {user_id}: {e}")
         return None
 
-def build_match_embed(partner_id: int, show_info: bool) -> discord.Embed:
+async def build_match_embed(partner_id: int, show_info: bool) -> discord.Embed:
     embed = discord.Embed(
         title="✅ Terhubung!",
         description="Kamu terhubung dengan orang asing. Mulai ngobrol sekarang!",
         color=0x2ecc71
     )
-    if show_info and partner_id in user_info:
-        info = user_info[partner_id]
-        gender = info.get("gender", "?")
+    if show_info:
+        gender = await get_user_gender(partner_id) or "?"
         embed.add_field(name="👤 Info Lawan", value=f"Gender: **{gender}**", inline=False)
     embed.add_field(name="Commands", value="`!next` → ganti orang\n`!cancel` → berhenti", inline=False)
     if show_info:
@@ -258,7 +323,6 @@ async def disconnect_pair(user_id: int, reason: str = "Percakapan diakhiri."):
         if partner:
             await safe_send(partner, "🔴 Orang asing telah meninggalkan percakapan.\nKetik `!start` untuk mencari orang baru.")
 
-
 # ─────────────────────────────────────────────
 #  BACKGROUND TASK: CLEANUP
 # ─────────────────────────────────────────────
@@ -271,16 +335,16 @@ async def cleanup_stale_queue():
         remove_from_queue(uid)
         user = await get_user_safe(uid)
         if user:
-            await safe_send(user, f"⏰ Kamu sudah menunggu terlalu lama dan dikeluarkan dari antrian.\nKetik `!start` untuk mencoba lagi.")
+            await safe_send(user, "⏰ Kamu sudah menunggu terlalu lama dan dikeluarkan dari antrian.\nKetik `!start` untuk mencoba lagi.")
         log.info(f"User {uid} timeout dari queue.")
 
-    expired_premium = [uid for uid in list(premium_queue.keys()) if not is_premium(uid)]
-    for uid in expired_premium:
-        premium_queue.pop(uid, None)
-        waiting_queue[uid] = time.time()
-        user = await get_user_safe(uid)
-        if user:
-            await safe_send(user, "⚠️ Premium kamu habis! Kamu dipindahkan ke antrian biasa.")
+    for uid in list(premium_queue.keys()):
+        if not await is_premium(uid):
+            premium_queue.pop(uid, None)
+            waiting_queue[uid] = time.time()
+            user = await get_user_safe(uid)
+            if user:
+                await safe_send(user, "⚠️ Premium kamu habis! Kamu dipindahkan ke antrian biasa.")
 
     if stale:
         log.info(f"Cleanup: {len(stale)} user free timeout.")
@@ -289,12 +353,12 @@ async def cleanup_stale_queue():
 async def before_cleanup():
     await bot.wait_until_ready()
 
-
 # ─────────────────────────────────────────────
 #  EVENTS
 # ─────────────────────────────────────────────
 @bot.event
 async def on_ready():
+    await init_db()
     log.info(f"Bot online sebagai {bot.user} (ID: {bot.user.id})")
     cleanup_stale_queue.start()
     try:
@@ -355,48 +419,54 @@ async def on_command_error(ctx: commands.Context, error):
         log.error(f"Error command '{ctx.command}': {error}", exc_info=True)
         await safe_send(ctx.author, "❌ Terjadi error. Coba lagi nanti.")
 
-
 # ─────────────────────────────────────────────
-#  MATCH LOGIC
+#  MATCH LOGIC (with lock — fix race condition)
 # ─────────────────────────────────────────────
 async def do_match(user: discord.User):
-    user_id = user.id
-    prem = is_premium(user_id)
-    available = get_available_partners(user_id)
+    async with match_lock:
+        user_id = user.id
+        prem = await is_premium(user_id)
+        available = get_available_partners(user_id)
 
-    if available:
-        partner_id = available[0]
-        remove_from_queue(partner_id)
+        if available:
+            partner_id = available[0]
+            remove_from_queue(partner_id)
 
-        active_pairs[user_id] = partner_id
-        active_pairs[partner_id] = user_id
+            active_pairs[user_id] = partner_id
+            active_pairs[partner_id] = user_id
+            record_pair(user_id, partner_id)
+            if not partner:
+                del active_pairs[user_id]
+                del active_pairs[partner_id]
+                if prem:
+                    premium_queue[user_id] = time.time()
+                else:
+                    waiting_queue[user_id] = time.time()
+                await safe_send(user, "🔍 Menambahkan ke antrian... menunggu orang asing.")
+                return
 
-        partner = await get_user_safe(partner_id)
-        if not partner:
-            del active_pairs[user_id]
-            del active_pairs[partner_id]
+            partner_prem = await is_premium(partner_id)
+            embed_user = await build_match_embed(partner_id, show_info=prem)
+            embed_partner = await build_match_embed(user_id, show_info=partner_prem)
+
+        else:
             if prem:
                 premium_queue[user_id] = time.time()
             else:
                 waiting_queue[user_id] = time.time()
-            await safe_send(user, "🔍 Menambahkan ke antrian... menunggu orang asing.")
-            return
+            available = None
 
-        partner_prem = is_premium(partner_id)
-        embed_user = build_match_embed(partner_id, show_info=prem)
+    # Kirim embed di luar lock supaya tidak blocking
+    if available:
         await safe_send(user, embed=embed_user)
-        embed_partner = build_match_embed(user_id, show_info=partner_prem)
         await safe_send(partner, embed=embed_partner)
         log.info(f"Match: {user_id}{'⭐' if prem else ''} <-> {partner_id}{'⭐' if partner_prem else ''}")
     else:
         if prem:
-            premium_queue[user_id] = time.time()
             await safe_send(user, "⭐ **[Premium]** Kamu masuk antrian prioritas!\nKetik `!cancel` untuk membatalkan.")
         else:
-            waiting_queue[user_id] = time.time()
             await safe_send(user, "🔍 Mencari orang asing... Mohon tunggu.\nKetik `!cancel` untuk membatalkan pencarian.")
         log.info(f"User {user_id} masuk antrian {'premium' if prem else 'free'}.")
-
 
 # ─────────────────────────────────────────────
 #  COMMANDS — CHAT
@@ -424,7 +494,8 @@ async def cmd_start(ctx: commands.Context):
         await safe_send(user, "🔍 Kamu sudah dalam antrian. Mohon tunggu...")
         return
 
-    if user_id not in user_info:
+    gender = await get_user_gender(user_id)
+    if not gender:
         await safe_send(user,
             "👋 Sebelum mulai, **pilih gendermu** dengan mengetik:\n"
             "`!setgender pria` atau `!setgender wanita`\n\n"
@@ -488,7 +559,7 @@ async def cmd_cancel(ctx: commands.Context):
         return
 
     if is_in_pair(user_id):
-        await disconnect_pair(user_id, "Percakapan diakhiri oleh orang asing.")
+        await disconnect_pair(user_id, "Percakapan diakhiri oleh kamu.")
         await safe_send(user, "🔴 Percakapan diakhiri. Sampai jumpa!\nKetik `!start` kalau mau ngobrol lagi.")
     elif is_in_queue(user_id):
         remove_from_queue(user_id)
@@ -507,7 +578,7 @@ async def cmd_setgender(ctx: commands.Context, gender: str = None):
         await safe_send(ctx.author, "❌ Pilihan tidak valid.\nKetik `!setgender pria` atau `!setgender wanita`")
         return
 
-    user_info[ctx.author.id] = {"gender": gender.lower()}
+    await set_user_gender(ctx.author.id, gender.lower())
     await safe_send(ctx.author, f"✅ Gender kamu diset ke **{gender.lower()}**.\nSekarang ketik `!start` untuk mulai mencari!")
 
 
@@ -518,27 +589,30 @@ async def cmd_status(ctx: commands.Context):
         return
 
     user_id = ctx.author.id
-    prem = is_premium(user_id)
-    expiry = get_premium_expiry(user_id)
+    prem = await is_premium(user_id)
+    expiry = await get_premium_expiry(user_id)
 
     if is_in_pair(user_id):
         status = "💬 Sedang dalam percakapan"
-    elif is_in_queue(user_id):
-        q = "⭐ Antrian Premium" if user_id in premium_queue else "🔍 Antrian Biasa"
-        wait = int(time.time() - (premium_queue.get(user_id) or waiting_queue.get(user_id, time.time())))
-        status = f"{q} ({wait} detik)"
+    elif user_id in premium_queue:
+        wait = int(time.time() - premium_queue[user_id])
+        status = f"⭐ Antrian Premium ({wait} detik)"
+    elif user_id in waiting_queue:
+        wait = int(time.time() - waiting_queue[user_id])
+        status = f"🔍 Antrian Biasa ({wait} detik)"
     else:
         status = "😴 Tidak aktif"
 
     embed = discord.Embed(title="📊 Status Kamu", color=0xf1c40f if prem else 0x95a5a6)
     embed.add_field(name="Status Chat", value=status, inline=False)
-    embed.add_field(
-        name="Akun",
-        value=("⭐ **Premium** — berlaku hingga **" + datetime.fromisoformat(expiry).strftime('%d %b %Y') + "**")
-              if prem and expiry else "🆓 Free",
-        inline=False
-    )
-    gender = user_info.get(user_id, {}).get("gender", "belum diset")
+
+    if prem and expiry:
+        exp_str = expiry.strftime('%d %b %Y') + " UTC"
+        embed.add_field(name="Akun", value=f"⭐ **Premium** — berlaku hingga **{exp_str}**", inline=False)
+    else:
+        embed.add_field(name="Akun", value="🆓 Free", inline=False)
+
+    gender = await get_user_gender(user_id) or "belum diset"
     embed.add_field(name="Gender", value=gender, inline=True)
     await ctx.author.send(embed=embed)
 
@@ -562,7 +636,6 @@ async def cmd_help(ctx: commands.Context):
     else:
         await ctx.send(msg)
 
-
 # ─────────────────────────────────────────────
 #  COMMANDS — PREMIUM
 # ─────────────────────────────────────────────
@@ -584,16 +657,13 @@ async def cmd_premium(ctx: commands.Context):
     )
     embed.add_field(
         name="💰 Harga",
-        value=(
-            "**7 Hari** → Rp 30.000\n"
-            "**30 Hari** → Rp 190.000\n"
-        ),
+        value="**7 Hari** → Rp 30.000\n**30 Hari** → Rp 190.000\n",
         inline=False
     )
     embed.add_field(
         name="📲 Cara Beli",
         value=(
-            "1. DM admin: " + ADMIN_MENTION + "\n"
+            f"1. DM admin: {ADMIN_MENTION}\n"
             "2. Setelah bayar, kamu dapat key unik\n"
             "3. Ketik `!redeem <key>` untuk aktivasi\n"
         ),
@@ -616,12 +686,11 @@ async def cmd_redeem(ctx: commands.Context, key: str = None):
         await safe_send(ctx.author, "❌ Masukkan key premium.\nContoh: `!redeem PREM7-XXXXXX-XXXXXX`")
         return
 
-    success, message = activate_key(ctx.author.id, key.strip().upper())
+    success, message = await activate_key(ctx.author.id, key.strip().upper())
     await safe_send(ctx.author, message)
 
     if success:
         log.info(f"User {ctx.author.id} aktivasi key: {key}")
-
 
 # ─────────────────────────────────────────────
 #  COMMANDS — ADMIN
@@ -647,19 +716,10 @@ async def cmd_genkey(ctx: commands.Context, plan: str = None):
     plan_data = PREMIUM_PLANS[plan]
     key = generate_key(plan_data["days"])
 
-    keys = load_keys()
-    keys[key] = {
-        "days": plan_data["days"],
-        "plan": plan_data["label"],
-        "price": plan_data["price"],
-        "used": False,
-        "created_at": datetime.now().isoformat(),
-        "created_by": ctx.author.id,
-    }
-    save_keys(keys)
+    await save_key(key, plan_data["days"], plan_data["label"], plan_data["price"], ctx.author.id)
 
     embed = discord.Embed(title="🔑 Key Premium Generated", color=0x2ecc71)
-    embed.add_field(name="Key", value="`" + key + "`", inline=False)
+    embed.add_field(name="Key", value=f"`{key}`", inline=False)
     embed.add_field(name="Plan", value=plan_data["label"], inline=True)
     embed.add_field(name="Harga", value=f"Rp {plan_data['price']:,}", inline=True)
     embed.set_footer(text="Kirim key ini ke user setelah pembayaran dikonfirmasi")
@@ -677,15 +737,15 @@ async def cmd_listkeys(ctx: commands.Context):
         await safe_send(ctx.author, "❌ Akses ditolak.")
         return
 
-    keys = load_keys()
-    if not keys:
+    rows = await list_keys(20)
+    if not rows:
         await safe_send(ctx.author, "📭 Belum ada key yang dibuat.")
         return
 
     lines = []
-    for k, v in list(keys.items())[-20:]:
-        status = "✅ Terpakai" if v.get("used") else "🟢 Tersedia"
-        lines.append("`" + k + "` — " + v["plan"] + " — " + status)
+    for r in rows:
+        status = "✅ Terpakai" if r["used"] else "🟢 Tersedia"
+        lines.append(f"`{r['key']}` — {r['plan']} — {status}")
 
     await safe_send(ctx.author, "**🔑 Daftar Key (20 terakhir):**\n" + "\n".join(lines))
 
@@ -705,19 +765,18 @@ async def cmd_cekuser(ctx: commands.Context, user_id: str = None):
         return
 
     uid = int(user_id)
-    prem = is_premium(uid)
-    expiry = get_premium_expiry(uid)
+    prem = await is_premium(uid)
+    expiry = await get_premium_expiry(uid)
 
     user = await get_user_safe(uid)
     name = str(user) if user else f"ID: {uid}"
 
     if prem and expiry:
-        status = "⭐ Premium hingga **" + datetime.fromisoformat(expiry).strftime('%d %b %Y %H:%M') + "**"
+        status = "⭐ Premium hingga **" + expiry.strftime('%d %b %Y %H:%M') + " UTC**"
     else:
         status = "🆓 Free"
 
     await safe_send(ctx.author, f"**👤 {name}**\nStatus: {status}")
-
 
 # ─────────────────────────────────────────────
 #  MAIN
